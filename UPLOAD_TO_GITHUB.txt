@@ -1,0 +1,8 @@
+برای ساخت فایل APK:
+۱) تمام فایل‌ها و پوشه‌های داخل این ZIP را Extract کنید.
+۲) به https://github.com/pikopostudio/PayamYar-Android بروید.
+۳) Add file > Upload files را انتخاب کنید و همه فایل‌ها و پوشه‌های Extract شده را روی صفحه بکشید.
+۴) Commit changes را بزنید.
+۵) وارد Actions شوید؛ گردش کار Build PayamYar Android APK را باز کنید.
+۶) اگر ساخت موفق شد، از قسمت Artifacts فایل PayamYar-debug-APK را دانلود کنید.
+توجه: سورس هنوز روی سرور واقعی کامپایل نشده و ممکن است نیازمند رفع خطای ساخت باشد.
