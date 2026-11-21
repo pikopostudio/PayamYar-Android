@@ -71,8 +71,7 @@ class TelegramEngine(
                     systemLanguageCode = "fa"
                     deviceModel = Build.MODEL
                     systemVersion = "Android ${Build.VERSION.RELEASE}"
-                    applicationVersion = "1.0.0-beta"
-                    enableStorageOptimizer = true
+                    applicationVersion = "1.1.0-beta"
                 }
                 send(p, ::authResult)
             }
