@@ -72,6 +72,7 @@ class TelegramEngine(
                     deviceModel = Build.MODEL
                     systemVersion = "Android ${Build.VERSION.RELEASE}"
                     applicationVersion = "1.0.0-beta"
+                    enableStorageOptimizer = true
                 }
                 send(p, ::authResult)
             }
@@ -120,27 +121,99 @@ class TelegramEngine(
     fun sendEmail(email: String) { send(TdApi.SetAuthenticationEmailAddress(email.trim()), ::authResult) }
     fun sendEmailCode(code: String) { send(TdApi.CheckAuthenticationEmailCode(TdApi.EmailAddressAuthenticationCode(code.trim())), ::authResult) }
 
+    /**
+     * Sync both Telegram contacts AND people from existing private dialogs.
+     * The v1 UI only used GetContacts, which misses people the user has chatted with
+     * but never saved to Telegram contacts. All requests run through TDLib; the
+     * phone address book is not read or uploaded.
+     */
+    private val syncGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
     fun loadContacts() {
         if (!ready) { error("ابتدا به حساب تلگرام وارد شو."); return }
-        emit("loading", JSONObject().put("kind", "contacts"))
-        send(TdApi.GetContacts()) { res ->
-            if (res !is TdApi.Users) { handleError(res); return@send }
-            val ids = res.userIds.distinct().take(3000)
-            val contacts = JSONArray()
-            fun step(i: Int) {
-                if (i >= ids.size) {
-                    emit("contacts", JSONObject().put("items", contacts)); return
-                }
-                send(TdApi.GetUser(ids[i])) { item ->
-                    if (item is TdApi.User && item.type !is TdApi.UserTypeBot && item.type !is TdApi.UserTypeDeleted && item.id != accountId) {
-                        contacts.put(JSONObject().put("id", item.id.toString())
-                            .put("name", (item.firstName + " " + item.lastName).trim().ifBlank { "مخاطب ${item.id}" }))
+        val generation = syncGeneration.incrementAndGet()
+        emit("loading", JSONObject().put("kind", "contacts").put("message", "در حال دریافت مخاطبان و گفتگوها..."))
+        send(TdApi.GetContacts()) { contactResult ->
+            if (generation != syncGeneration.get()) return@send
+            val savedIds = if (contactResult is TdApi.Users) contactResult.userIds.distinct().take(3000) else emptyList()
+            // Prime the main-chat cache so recent conversations are discoverable
+            // even on a freshly authorized device.
+            send(TdApi.LoadChats(TdApi.ChatListMain(), 100)) { _ ->
+            send(TdApi.GetChats(TdApi.ChatListMain(), 500)) { chatResult ->
+                if (generation != syncGeneration.get()) return@send
+                val chatIds = if (chatResult is TdApi.Chats) chatResult.chatIds.distinct().take(500) else emptyList()
+                val priorIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+                // A bounded number of TDLib callbacks are in flight at once.
+                parallelWalk(chatIds.size, 8, { index, done ->
+                    send(TdApi.GetChat(chatIds[index])) { chat ->
+                        if (chat is TdApi.Chat && chat.type is TdApi.ChatTypePrivate) {
+                            val userId = (chat.type as TdApi.ChatTypePrivate).userId
+                            if (userId != accountId) priorIds.add(userId)
+                        }
+                        done()
                     }
-                    step(i + 1)
+                }) {
+                    if (generation != syncGeneration.get()) return@parallelWalk
+                    val contactSet = savedIds.toHashSet()
+                    val allIds = (savedIds + priorIds).distinct().take(3500)
+                    val found = java.util.concurrent.ConcurrentHashMap<Long, JSONObject>()
+                    parallelWalk(allIds.size, 10, { index, done ->
+                        val id = allIds[index]
+                        send(TdApi.GetUser(id)) { user ->
+                            if (user is TdApi.User && user.type !is TdApi.UserTypeBot &&
+                                user.type !is TdApi.UserTypeDeleted && user.id != accountId) {
+                                val name = (user.firstName + " " + user.lastName).trim()
+                                    .ifBlank { "مخاطب ${user.id}" }
+                                found[user.id] = JSONObject()
+                                    .put("id", user.id.toString())
+                                    .put("name", name)
+                                    .put("source", if (contactSet.contains(user.id)) "contact" else "chat")
+                            }
+                            done()
+                        }
+                    }) {
+                        if (generation != syncGeneration.get()) return@parallelWalk
+                        val ordered = found.values.sortedWith(
+                            compareBy<JSONObject> { it.optString("source") != "contact" }
+                                .thenBy { it.optString("name").lowercase(Locale.getDefault()) }
+                        )
+                        val result = JSONArray()
+                        ordered.forEach { result.put(it) }
+                        emit("contacts", JSONObject().put("items", result)
+                            .put("savedCount", ordered.count { it.optString("source") == "contact" })
+                            .put("chatCount", ordered.count { it.optString("source") == "chat" }))
+                        if (contactResult is TdApi.Error && chatResult is TdApi.Error) {
+                            error("دریافت مخاطبان و گفتگوها ناموفق بود. اتصال اینترنت و وضعیت ورود را بررسی و دوباره همگام‌سازی کن.")
+                        }
+                    }
                 }
             }
-            step(0)
+            }
         }
+    }
+
+    /** Execute asynchronous TDLib lookups with bounded concurrency, then finish once. */
+    private fun parallelWalk(
+        size: Int,
+        width: Int,
+        action: (Int, () -> Unit) -> Unit,
+        onComplete: () -> Unit
+    ) {
+        if (size == 0) { onComplete(); return }
+        val next = java.util.concurrent.atomic.AtomicInteger(0)
+        val completed = java.util.concurrent.atomic.AtomicInteger(0)
+        fun launchOne(continuation: () -> Unit) {
+            val index = next.getAndIncrement()
+            if (index >= size) return
+            action(index) {
+                if (completed.incrementAndGet() == size) onComplete()
+                else continuation()
+            }
+        }
+        // The callbacks recurse only once the previous operation has completed.
+        lateinit var worker: () -> Unit
+        worker = { launchOne(worker) }
+        repeat(minOf(width, size)) { worker() }
     }
 
     /** Input rows: [{id:string,name:string,text:string}], startMs >= 5 minutes in future, rate 1..20. */

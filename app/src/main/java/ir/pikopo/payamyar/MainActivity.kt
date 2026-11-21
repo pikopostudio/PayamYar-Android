@@ -2,6 +2,8 @@ package ir.pikopo.payamyar
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.Build
 import android.view.WindowInsets
@@ -83,6 +85,9 @@ class MainActivity : Activity() {
         @JavascriptInterface fun sendEmail(value: String) = runOnUiThread { engine.sendEmail(value) }
         @JavascriptInterface fun sendEmailCode(value: String) = runOnUiThread { engine.sendEmailCode(value) }
         @JavascriptInterface fun loadContacts() = runOnUiThread { engine.loadContacts() }
+        @JavascriptInterface fun openApiGuide() = runOnUiThread {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://my.telegram.org")))
+        }
         @JavascriptInterface fun getCampaignStatus() = runOnUiThread { engine.summary() }
         @JavascriptInterface fun submitCampaign(payload: String) = runOnUiThread {
             try { engine.submitCampaign(JSONObject(payload)) }
