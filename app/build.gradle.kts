@@ -7,11 +7,11 @@ android {
     namespace = "ir.pikopo.payamyar"
     compileSdk = 35
     defaultConfig {
-        applicationId = "ir.pikopo.payamyar.reinstalled"
+        applicationId = "ir.pikopo.payamyar.authfix"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1.1-beta"
+        versionCode = 4
+        versionName = "1.1.2-beta"
     }
     buildTypes {
         release { isMinifyEnabled = false }
