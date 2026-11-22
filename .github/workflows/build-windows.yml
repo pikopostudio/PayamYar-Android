@@ -45,6 +45,15 @@ jobs:
           if (!(Test-Path "dist/PayamYar/PayamYar.exe")) { throw "Missing EXE" }
           Copy-Item windows/README_FA.md dist/PayamYar/README_FA.md
           Compress-Archive -Path dist/PayamYar/* -DestinationPath PayamYar-Windows-Portable.zip -Force
+      - name: Launch smoke test (headless Qt)
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $process = Start-Process -FilePath "dist/PayamYar/PayamYar.exe" -PassThru
+          Start-Sleep -Seconds 5
+          $process.Refresh()
+          if ($process.HasExited) { throw "EXE closed unexpectedly with code $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
       - uses: actions/upload-artifact@v4
         with:
           name: PayamYar-Windows-Portable
