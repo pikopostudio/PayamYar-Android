@@ -25,6 +25,11 @@ jobs:
           Expand-Archive -LiteralPath source.zip -DestinationPath windows -Force
           Write-Host "Files extracted:"
           Get-ChildItem windows -Recurse -File | Select-Object -ExpandProperty FullName
+      - name: Repair sidebar navigation callbacks
+        shell: pwsh
+        run: |
+          python windows/fix_navigation.py
+          Select-String -Path windows/src/main.py -Pattern 'page=key: self.show_page' -SimpleMatch
       - name: Install dependencies
         shell: pwsh
         run: |
@@ -34,8 +39,14 @@ jobs:
         shell: pwsh
         run: |
           $env:PYTHONPATH = "windows/src"
-          python -m pytest -q windows/tests
+          python -m pytest -q windows/tests windows/test_navigation_regression.py
           python -m compileall -q windows/src
+      - name: Test actual Qt navigation on Windows
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:PYTHONPATH = "windows/src"
+          python -m pytest -q windows/test_navigation_regression.py
       - name: Build EXE
         shell: pwsh
         run: |
