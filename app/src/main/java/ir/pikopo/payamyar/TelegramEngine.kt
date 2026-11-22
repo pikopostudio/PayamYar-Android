@@ -27,6 +27,10 @@ class TelegramEngine(
     private var ready = false
     private var credentials: Pair<Int, String>? = null
     private var pendingPhone: String? = null
+    // All authentication state and requests are serialized on the Android main thread.
+    // A TDLib auth request must not be issued again while its stage is in progress.
+    private var authStage = "initial"
+    private var authInFlight: String? = null
     private var accountId: Long = 0
     private var stopped = false
     private var sentThisRun = 0
@@ -34,9 +38,21 @@ class TelegramEngine(
     fun isReady() = ready
     fun start(id: Int, hash: String, phone: String = "") {
         if (id <= 0 || hash.length !in 20..128) { error("شناسه API یا API Hash نامعتبر است."); return }
-        if (client != null) { if (phone.isNotBlank()) sendPhone(phone); return }
+        if (client != null) {
+            if (credentials != (id to hash)) {
+                error("اطلاعات API با نشست در حال اجرا تفاوت دارد. ابتدا اتصال فعلی را بازنشانی کن.")
+                return
+            }
+            // A second press of Connect can only queue the phone number, never
+            // start a second authorization query before TDLib asks for it.
+            if (phone.isNotBlank()) sendPhone(phone)
+            else emit("auth", JSONObject().put("stage", authStage))
+            return
+        }
         credentials = id to hash
         pendingPhone = phone.takeIf { it.isNotBlank() }
+        authStage = "initial"
+        authInFlight = null
         try {
             System.loadLibrary("tdjni")
             client = Client.create({ update -> onUpdate(update) }, null, null)
@@ -50,12 +66,34 @@ class TelegramEngine(
         c.send(request) { result -> callback(result) }
     }
     private fun onUpdate(update: TdApi.Object) {
-        when (update) {
-            is TdApi.UpdateAuthorizationState -> onAuth(update.authorizationState)
-            is TdApi.UpdateConnectionState -> emit("connection", JSONObject().put("state", update.state.javaClass.simpleName))
+        // TDLib callbacks may run on different threads. Keep login transitions
+        // ordered with the UI bridge, which is also dispatched to the main thread.
+        handler.post {
+            when (update) {
+                is TdApi.UpdateAuthorizationState -> onAuth(update.authorizationState)
+                is TdApi.UpdateConnectionState -> emit("connection", JSONObject().put("state", update.state.javaClass.simpleName))
+            }
         }
     }
     private fun onAuth(state: TdApi.AuthorizationState) {
+        val nextStage = when (state) {
+            is TdApi.AuthorizationStateWaitTdlibParameters -> "parameters"
+            is TdApi.AuthorizationStateWaitPhoneNumber -> "phone"
+            is TdApi.AuthorizationStateWaitCode -> "code"
+            is TdApi.AuthorizationStateWaitPassword -> "password"
+            is TdApi.AuthorizationStateWaitEmailAddress -> "email"
+            is TdApi.AuthorizationStateWaitEmailCode -> "emailCode"
+            is TdApi.AuthorizationStateWaitOtherDeviceConfirmation -> "device"
+            is TdApi.AuthorizationStateWaitRegistration -> "registration"
+            is TdApi.AuthorizationStateReady -> "ready"
+            is TdApi.AuthorizationStateLoggingOut, is TdApi.AuthorizationStateClosing,
+            is TdApi.AuthorizationStateClosed -> "disconnected"
+            else -> "other"
+        }
+        if (authStage != nextStage) {
+            authStage = nextStage
+            authInFlight = null
+        }
         when (state) {
             is TdApi.AuthorizationStateWaitTdlibParameters -> {
                 val cfg = credentials ?: return error("اطلاعات اتصال پیدا نشد")
@@ -73,11 +111,14 @@ class TelegramEngine(
                     systemVersion = "Android ${Build.VERSION.RELEASE}"
                     applicationVersion = "1.1.0-beta"
                 }
-                send(p, ::authResult)
+                beginAuth("parameters", p)
             }
             is TdApi.AuthorizationStateWaitPhoneNumber -> {
                 emit("auth", JSONObject().put("stage", "phone"))
-                pendingPhone?.let { sendPhone(it); pendingPhone = null }
+                pendingPhone?.let { number ->
+                    pendingPhone = null
+                    sendPhone(number)
+                }
             }
             is TdApi.AuthorizationStateWaitCode -> emit("auth", JSONObject().put("stage", "code"))
             is TdApi.AuthorizationStateWaitPassword -> emit("auth", JSONObject().put("stage", "password"))
@@ -105,20 +146,69 @@ class TelegramEngine(
             }
             is TdApi.AuthorizationStateClosed -> {
                 ready = false; client = null; credentials = null
+                pendingPhone = null
+                authInFlight = null
                 emit("auth", JSONObject().put("stage", "disconnected"))
             }
             else -> emit("auth", JSONObject().put("stage", "other").put("detail", state.javaClass.simpleName))
         }
     }
-    private fun authResult(result: TdApi.Object) { handleError(result) }
-    fun sendPhone(phone: String) {
-        if (!phone.matches(Regex("\\+[1-9][0-9]{6,14}"))) { error("شماره را با کد کشور، مثل +98912... وارد کن."); return }
-        send(TdApi.SetAuthenticationPhoneNumber(phone, null), ::authResult)
+    private fun beginAuth(stage: String, request: TdApi.Function<*>) {
+        if (authStage != stage) {
+            error("تلگرام هنوز آماده دریافت این اطلاعات نیست. مرحله ورود فعلی را بررسی کن.")
+            return
+        }
+        if (authInFlight != null) {
+            emit("info", JSONObject().put("message", "درخواست ورود قبلی در حال بررسی است؛ دوباره ارسال نکن."))
+            return
+        }
+        authInFlight = stage
+        send(request) { response ->
+            handler.post {
+                // A successful query advances the authorization state. Keep the
+                // guard held until TDLib actually reports the next state.
+                if (response is TdApi.Error && authStage == stage && authInFlight == stage) {
+                    authInFlight = null
+                    if (response.message.contains("Another authorization query has started", ignoreCase = true)) {
+                        error("درخواست ورود قبلی هنوز در تلگرام در حال پردازش است. چند لحظه بعد دوباره امتحان کن.")
+                    } else {
+                        handleError(response)
+                    }
+                    emit("auth", JSONObject().put("stage", stage))
+                }
+            }
+        }
     }
-    fun sendCode(code: String) { send(TdApi.CheckAuthenticationCode(code.trim()), ::authResult) }
-    fun sendPassword(password: String) { send(TdApi.CheckAuthenticationPassword(password), ::authResult) }
-    fun sendEmail(email: String) { send(TdApi.SetAuthenticationEmailAddress(email.trim()), ::authResult) }
-    fun sendEmailCode(code: String) { send(TdApi.CheckAuthenticationEmailCode(TdApi.EmailAddressAuthenticationCode(code.trim())), ::authResult) }
+
+    fun sendPhone(phone: String) {
+        val normalized = phone.trim()
+        if (!normalized.matches(Regex("\\+[1-9][0-9]{6,14}"))) {
+            error("شماره را با کد کشور، مثل +98912... وارد کن.")
+            return
+        }
+        if (authStage == "initial" || authStage == "parameters") {
+            pendingPhone = normalized
+            emit("info", JSONObject().put("message", "شماره ثبت شد؛ پس از آماده‌شدن تلگرام ارسال می‌شود."))
+            return
+        }
+        beginAuth("phone", TdApi.SetAuthenticationPhoneNumber(normalized, null))
+    }
+    fun sendCode(code: String) {
+        if (code.isBlank()) return error("کد تأیید را وارد کن.")
+        beginAuth("code", TdApi.CheckAuthenticationCode(code.trim()))
+    }
+    fun sendPassword(password: String) {
+        if (password.isBlank()) return error("رمز دومرحله‌ای را وارد کن.")
+        beginAuth("password", TdApi.CheckAuthenticationPassword(password))
+    }
+    fun sendEmail(email: String) {
+        if (email.isBlank()) return error("ایمیل را وارد کن.")
+        beginAuth("email", TdApi.SetAuthenticationEmailAddress(email.trim()))
+    }
+    fun sendEmailCode(code: String) {
+        if (code.isBlank()) return error("کد ایمیل را وارد کن.")
+        beginAuth("emailCode", TdApi.CheckAuthenticationEmailCode(TdApi.EmailAddressAuthenticationCode(code.trim())))
+    }
 
     /**
      * Sync both Telegram contacts AND people from existing private dialogs.
