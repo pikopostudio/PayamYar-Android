@@ -1,0 +1,50 @@
+name: Build PayamYar Windows EXE
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'windows/**'
+      - '.github/workflows/build-windows.yml'
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Restore Windows source from bundle
+        shell: pwsh
+        run: |
+          $encoded = (Get-Content windows/source.bundle.b64 -Raw).Trim()
+          [System.IO.File]::WriteAllBytes("source.zip", [System.Convert]::FromBase64String($encoded))
+          New-Item -ItemType Directory -Force windows | Out-Null
+          Expand-Archive -LiteralPath source.zip -DestinationPath windows -Force
+          Write-Host "Files extracted:"
+          Get-ChildItem windows -Recurse -File | Select-Object -ExpandProperty FullName
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r windows/requirements.txt pytest
+      - name: Test and compile Python
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "windows/src"
+          python -m pytest -q windows/tests
+          python -m compileall -q windows/src
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name PayamYar --icon windows/assets/payamyar.ico --add-data "windows/assets/payamyar.ico;assets" --paths windows/src windows/src/main.py
+          if (!(Test-Path "dist/PayamYar/PayamYar.exe")) { throw "Missing EXE" }
+          Copy-Item windows/README_FA.md dist/PayamYar/README_FA.md
+          Compress-Archive -Path dist/PayamYar/* -DestinationPath PayamYar-Windows-Portable.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PayamYar-Windows-Portable
+          path: PayamYar-Windows-Portable.zip
+          if-no-files-found: error
